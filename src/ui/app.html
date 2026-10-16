@@ -478,7 +478,7 @@ details.qsect{margin-top:12px;box-shadow:none}
       <summary><h2>Sending</h2><span class="sum" id="sendSum"></span></summary>
       <div class="in">
         <div class="grid2">
-          <div><label for="daily_limit">Emails per day, all lists together</label><input type="number" id="daily_limit" name="daily_limit" min="1" max="150" inputmode="numeric"><div class="help">Split evenly across the lists that are on. Start low and raise slowly: 20, 35, 50, 70.</div></div>
+          <div><label for="daily_limit">Emails per day, all lists together</label><input type="number" id="daily_limit" name="daily_limit" min="1" max="250" inputmode="numeric"><div class="help">Split evenly across the lists that are on. Up to 250. Start low and raise slowly: 20, 35, 50, 70 — a new Gmail sending too many at once gets marked as spam.</div></div>
           <div><label for="followup_days">Follow up after (business days)</label><input type="number" id="followup_days" name="followup_days" min="1" max="30" inputmode="numeric"></div>
           <div><label for="stop_days">Mark "No reply" after the follow-up (business days)</label><input type="number" id="stop_days" name="stop_days" min="1" max="60" inputmode="numeric"></div>
           <div><label for="auto_drafts">Prepare drafts automatically</label><select id="auto_drafts" name="auto_drafts"><option value="yes">Yes, every weekday from 9 AM</option><option value="no">No, only when I tap Create drafts</option></select></div>
