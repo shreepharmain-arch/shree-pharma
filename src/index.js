@@ -1,12 +1,13 @@
 // Shree Pharma: website + private email dashboard on one Cloudflare Worker.
 import loginPage from './ui/login.html';
 import appPage from './ui/app.html';
-import { ensureSchema, getSettings, setSettings, log, counter, bump, EDITABLE, DEFAULT_TEMPLATES } from './db.js';
+import { ensureSchema, getSettings, setSettings, log, counter, bump, EDITABLE, DEFAULT_TEMPLATES, getOrCreateList } from './db.js';
 import { Gmail, GmailAuthError, BudgetError, oauthStartUrl, exchangeCode, googleUrls, buildMime, textToHtml } from './gmail.js';
 import {
   STATUS, PENDING, HAS_DRAFT, MANUAL_STATUSES, effective, dailyLimit, createDrafts, sendQueued, checkReplies, syncDrafts,
-  closeLead, sendAlert, compose, runCron, sentTodayKey
+  closeLead, sendAlert, compose, runCron, sentTodayKey, listPlan
 } from './engine.js';
+import { pushAll, vapidKeys, validSubscription, SERVICE_WORKER, MAX_DEVICES } from './push.js';
 import {
   json, html, redirect, getCookie, hmacHex, sha256Hex, safeEqual, randomHex, cleanEmail, firstName, clip, esc, istDay, isYes, DAY
 } from './util.js';
@@ -46,6 +47,9 @@ async function route(request, env, ctx) {
   }
   if (p.startsWith('/u/')) { await ensureSchema(env); return unsubscribe(request, env, p.slice(3)); }
   if (p === '/app/manifest.webmanifest') return manifest();
+  if (p === '/app/sw.js') {
+    return new Response(SERVICE_WORKER, { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache', 'service-worker-allowed': '/app' } });
+  }
   if (p === '/app' || p.startsWith('/app/')) { await ensureSchema(env); return appRoutes(request, env, url, p, m); }
   if (p.startsWith('/api/')) { await ensureSchema(env); return api(request, env, url, p, m); }
 
@@ -149,7 +153,12 @@ async function oauthCallback(request, env, url) {
   const pr = await fetch(googleUrls(env).api + '/profile', { headers: { authorization: 'Bearer ' + tok.access_token } });
   const profile = await pr.json().catch(() => ({}));
   if (!pr.ok || !profile.emailAddress) return html(simplePage('Could not read the Gmail address', '<p>Make sure the Gmail API is enabled in your Google Cloud project, then try again.</p>' + back), 502);
+  const before = await getSettings(env);
+  const newEmail = profile.emailAddress.toLowerCase();
+  const oldEmail = String(before.gmail_email || before.gmail_prev || '').trim().toLowerCase();
+  if (oldEmail && oldEmail !== newEmail) await switchSender(env, oldEmail, newEmail);
   await setSettings(env, {
+    gmail_prev: newEmail,
     gmail_refresh: tok.refresh_token,
     gmail_access: tok.access_token,
     gmail_access_exp: String(Date.now() + (Number(tok.expires_in) || 3600) * 1000),
@@ -159,6 +168,21 @@ async function oauthCallback(request, env, url) {
   });
   await log(env, 'Gmail connected', profile.emailAddress, '');
   return redirect('/app#settings', { 'set-cookie': cookie(OAUTH_COOKIE, '', 0) });
+}
+
+// Moving to a different Gmail account: drafts made in the old account can't be sent from the new one,
+// so they are put back to be drafted again. Leads already emailed remember the old address,
+// and their follow-up goes out from the new account as a fresh email.
+async function switchSender(env, oldEmail, newEmail) {
+  const now = Date.now();
+  const clear = `draft_id = NULL, drafted_at = NULL, draft_subject = NULL, draft_body = NULL, updated_at = ${now}`;
+  const r = await env.DB.batch([
+    env.DB.prepare('UPDATE leads SET sent_from = ? WHERE sent_from IS NULL AND thread_id IS NOT NULL').bind(oldEmail),
+    env.DB.prepare(`UPDATE leads SET status = 'new', ${clear} WHERE status IN ('drafting', 'drafted', 'queued', 'sending')`),
+    env.DB.prepare(`UPDATE leads SET status = 'sent', ${clear} WHERE status IN ('fu_drafting', 'fu_drafted', 'fu_queued', 'fu_sending')`)
+  ]);
+  const redo = ((r[1].meta && r[1].meta.changes) || 0) + ((r[2].meta && r[2].meta.changes) || 0);
+  await log(env, 'Sending account changed', newEmail, 'from ' + oldEmail + (redo ? '; ' + redo + ' unsent draft(s) will be made again in the new account' : ''));
 }
 
 /* ---------------- private API ---------------- */
@@ -198,12 +222,29 @@ async function api(request, env, url, p, m) {
       case 'POST /api/settings': return json(await saveSettings(env, body));
       case 'POST /api/test-email': return json(await testEmail(env, s, gmail(6)));
       case 'POST /api/gmail/disconnect':
-        await setSettings(env, { gmail_refresh: '', gmail_access: '', gmail_access_exp: '0', gmail_email: '', gmail_status: '' });
+        await setSettings(env, { gmail_prev: s.gmail_email || s.gmail_prev || '', gmail_refresh: '', gmail_access: '', gmail_access_exp: '0', gmail_email: '', gmail_status: '' });
         await log(env, 'Gmail disconnected', '', '');
         return json({ ok: true });
       case 'GET /api/enquiries': return json(await listEnquiries(env, url));
       case 'POST /api/enquiry-status': return json(await enquiryStatus(env, body));
       case 'GET /api/export': return json(await exportLeads(env, url));
+      case 'GET /api/push': return json(await pushStatus(env, s));
+      case 'POST /api/push/subscribe': return json(await pushSubscribe(env, body));
+      case 'POST /api/push/unsubscribe': {
+        await env.DB.prepare('DELETE FROM push_subs WHERE endpoint = ?').bind(String(body.endpoint || '')).run();
+        await log(env, 'Notifications turned off', '', clip(body.label, 60));
+        return json({ ok: true });
+      }
+      case 'POST /api/push/test': {
+        const r = await pushAll(env, { title: 'Shree Pharma notifications work', body: 'You will get a pop-up like this for buyer replies, website requests and drafts ready to approve.', url: '/app#settings', tag: 'test' }, s);
+        if (!r.devices) throw bad('No device has notifications turned on yet.');
+        if (!r.sent) throw bad('The notification could not be delivered. Turn notifications off and on again on this device.');
+        return json(r);
+      }
+      case 'GET /api/lists': return json(await listsView(env, s));
+      case 'POST /api/lists': return json(await updateList(env, body));
+      case 'GET /api/quotes': return json(await listQuotes(env, url, s));
+      case 'POST /api/quotes': return json(await createQuote(env, s, body));
       case 'GET /api/log': {
         const { results } = await env.DB.prepare('SELECT at, action, email, detail FROM log ORDER BY id DESC LIMIT 60').all();
         return json({ log: results });
@@ -229,14 +270,19 @@ async function summary(env, s, url) {
     await setSettings(env, { app_origin: o });
     s = effective({ ...s, app_origin: o });
   }
-  const [counts, ready, replies, enq, logRows, sentToday] = await Promise.all([
-    env.DB.prepare('SELECT status, COUNT(*) AS n FROM leads GROUP BY status').all(),
-    env.DB.prepare(`SELECT id, email, first_name, company, country, status, draft_subject FROM leads WHERE status IN ('drafted','fu_drafted') ORDER BY status DESC, id LIMIT 300`).all(),
-    env.DB.prepare(`SELECT id, email, company, country, status, thread_id, replied_at, reply_snippet FROM leads WHERE replied_at IS NOT NULL ORDER BY replied_at DESC LIMIT 15`).all(),
+  const listId = parseInt(url.searchParams.get('list'), 10) || 0;
+  const lw = listId ? ' AND list_id = ' + listId : '';     // listId is an integer, safe to inline
+  const [counts, ready, replies, enq, logRows, sentAll, plan] = await Promise.all([
+    env.DB.prepare('SELECT status, COUNT(*) AS n FROM leads WHERE 1=1' + lw + ' GROUP BY status').all(),
+    env.DB.prepare(`SELECT id, email, first_name, company, country, status, draft_subject, list_id FROM leads WHERE status IN ('drafted','fu_drafted')` + lw + ` ORDER BY status DESC, id LIMIT 300`).all(),
+    env.DB.prepare(`SELECT id, email, company, country, status, thread_id, replied_at, reply_snippet FROM leads WHERE replied_at IS NOT NULL` + lw + ` ORDER BY replied_at DESC LIMIT 15`).all(),
     env.DB.prepare(`SELECT COUNT(*) AS n FROM enquiries WHERE status = 'new'`).first(),
     env.DB.prepare('SELECT at, action, email, detail FROM log ORDER BY id DESC LIMIT 12').all(),
-    counter(env, sentTodayKey())
+    counter(env, sentTodayKey()),
+    listPlan(env, s)
   ]);
+  const one = listId ? plan.lists.find(l => l.id === listId) : null;
+  const sentToday = one ? one.sent_today : sentAll;
   const byStatus = {};
   for (const r of counts.results) byStatus[r.status] = Number(r.n);
   const queued = (byStatus.queued || 0) + (byStatus.fu_queued || 0) + (byStatus.sending || 0) + (byStatus.fu_sending || 0);
@@ -248,7 +294,9 @@ async function summary(env, s, url) {
     byStatus,
     total: Object.values(byStatus).reduce((a, b) => a + b, 0),
     sentToday,
-    limit: dailyLimit(s),
+    limit: one ? one.share : dailyLimit(s),
+    lists: plan.lists.map(l => ({ id: l.id, name: l.name, active: l.active, total: l.total, fresh: l.fresh, share: l.share, sent_today: l.sent_today })),
+    list: listId,
     queued,
     paused: isYes(s.paused),
     gmail: { email: s.gmail_email || '', problem: s.gmail_status || '', connected: !!(s.gmail_refresh && s.gmail_email) },
@@ -272,6 +320,8 @@ async function listLeads(env, url) {
     else { where.push('status = ?'); args.push(status); }
   }
   if (country) { where.push('country = ?'); args.push(country); }
+  const list = parseInt(url.searchParams.get('list'), 10) || 0;
+  if (list) { where.push('list_id = ?'); args.push(list); }
   const w = where.length ? ' WHERE ' + where.join(' AND ') : '';
   const per = 50;
   const [rows, total] = await Promise.all([
@@ -328,6 +378,17 @@ async function importLeads(env, b) {
   const source = clip(b.source || 'CSV', 120);
   const defCountry = clip(b.country, 80);
   const now = Date.now();
+  let listId = parseInt(b.list_id, 10) || 0;
+  if (listId) {
+    if (!(await env.DB.prepare('SELECT id FROM lists WHERE id = ?').bind(listId).first())) throw bad('That list no longer exists. Choose the file again.');
+  } else {
+    let name = clip(b.list_name || source.replace(/\.(csv|txt)$/i, ''), 80) || 'Imported leads';
+    // a new import always gets a new list, even if the name was used before
+    if (await env.DB.prepare('SELECT id FROM lists WHERE name = ?').bind(name).first()) name = (name + ' (' + new Date(now + 5.5 * 3600000).toISOString().slice(0, 10) + ')').slice(0, 80);
+    if (await env.DB.prepare('SELECT id FROM lists WHERE name = ?').bind(name).first()) name = (name.slice(0, 70) + ' #' + randomHex(2));
+    const r = await env.DB.prepare('INSERT INTO lists(name, active, created_at) VALUES(?, 1, ?)').bind(name, now).run();
+    listId = r.meta.last_row_id;
+  }
   const stmts = [];
   let invalid = 0;
   const seen = new Set();
@@ -337,10 +398,10 @@ async function importLeads(env, b) {
     if (seen.has(email)) continue;
     seen.add(email);
     stmts.push(env.DB.prepare(
-      `INSERT OR IGNORE INTO leads(email, first_name, company, country, business_type, phone, website, source, status, unsub_token, created_at, updated_at)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)`
+      `INSERT OR IGNORE INTO leads(email, first_name, company, country, business_type, phone, website, source, status, unsub_token, created_at, updated_at, list_id)
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)`
     ).bind(email, firstName(r.firstName || r.name || ''), clip(r.company, 200), clip(r.country || defCountry, 80), clip(r.type, 120),
-      clip(r.phone, 60), clip(r.website, 200), source, randomHex(16), now, now));
+      clip(r.phone, 60), clip(r.website, 200), source, randomHex(16), now, now, listId));
   }
   let added = 0;
   if (stmts.length) {
@@ -349,7 +410,31 @@ async function importLeads(env, b) {
   }
   const dupes = rows.length - invalid - added;
   if (b.last) await log(env, 'Import', '', source + (b.totals ? ': ' + b.totals : ''));
-  return { added, dupes, invalid };
+  return { added, dupes, invalid, list_id: listId };
+}
+
+async function listsView(env, s) {
+  const plan = await listPlan(env, s);
+  return { limit: plan.limit, lists: plan.lists };
+}
+async function updateList(env, b) {
+  const id = parseInt(b.id, 10) || 0;
+  const row = await env.DB.prepare('SELECT * FROM lists WHERE id = ?').bind(id).first();
+  if (!row) throw bad('List not found.');
+  if (typeof b.name === 'string') {
+    const name = clip(b.name, 80);
+    if (name.length < 1) throw bad('Give the list a name.');
+    const clash = await env.DB.prepare('SELECT id FROM lists WHERE name = ? AND id <> ?').bind(name, id).first();
+    if (clash) throw bad('Another list already has that name.');
+    await env.DB.prepare('UPDATE lists SET name = ? WHERE id = ?').bind(name, id).run();
+    await log(env, 'List renamed', '', row.name + ' → ' + name);
+  }
+  if ('active' in b) {
+    const on = b.active ? 1 : 0;
+    await env.DB.prepare('UPDATE lists SET active = ? WHERE id = ?').bind(on, id).run();
+    await log(env, on ? 'List turned on' : 'List paused', '', row.name);
+  }
+  return { ok: true };
 }
 
 async function apiDrafts(env, s, gm) {
@@ -358,6 +443,8 @@ async function apiDrafts(env, s, gm) {
   if (r.created) return { ...r, message: r.created + ' draft(s) created in Gmail' + (r.followups ? ', including ' + r.followups + ' follow-up(s)' : '') + '.' };
   const fresh = await env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE status = 'new'`).first();
   if (!fresh || !Number(fresh.n)) return { ...r, message: 'No new leads left to email. Import more leads.' };
+  const freshOn = await env.DB.prepare(`SELECT COUNT(*) AS n FROM leads d JOIN lists l ON l.id = d.list_id WHERE d.status = 'new' AND l.active = 1`).first();
+  if (!freshOn || !Number(freshOn.n)) return { ...r, message: 'All lists with leads left are paused. Turn a list on in Leads > Lists.' };
   return { ...r, message: 'Today\'s limit is already covered by drafts waiting or emails sent. Approve or skip the waiting drafts, or raise the daily limit in Settings.' };
 }
 
@@ -404,6 +491,7 @@ const SETTING_RULES = {
   website: v => { v = clip(v, 200); if (v && !/^https?:\/\/[^\s]+$/i.test(v)) throw bad('Website must start with https://'); return v; },
   brochure_link: v => { v = clip(v, 500); if (v && !/^https?:\/\/[^\s]+$/i.test(v)) throw bad('Brochure link must start with https://'); return v; },
   alert_email: v => { if (!String(v || '').trim()) return ''; const e = cleanEmail(v); if (!e) throw bad('Alert email is not a valid email address'); return e; },
+  main_email: v => { if (!String(v || '').trim()) return ''; const e = cleanEmail(v); if (!e) throw bad('Company email is not a valid email address'); return e; },
   daily_limit: v => { const n = parseInt(v, 10); if (!(n >= 1 && n <= 150)) throw bad('Daily limit must be between 1 and 150'); return String(n); },
   followup_days: v => { const n = parseInt(v, 10); if (!(n >= 1 && n <= 30)) throw bad('Follow-up days must be between 1 and 30'); return String(n); },
   stop_days: v => { const n = parseInt(v, 10); if (!(n >= 1 && n <= 60)) throw bad('Stop-watching days must be between 1 and 60'); return String(n); },
@@ -413,6 +501,7 @@ const SETTING_RULES = {
   tpl_first_body: v => { v = String(v || '').trim(); if (!v) throw bad('The first email cannot be empty'); return v.slice(0, 10000); },
   tpl_fu_body: v => { v = String(v || '').trim(); if (!v) throw bad('The follow-up email cannot be empty'); return v.slice(0, 10000); }
 };
+const PLACEHOLDERS = ['FirstName', 'Company', 'Country', 'YourName', 'CompanyName', 'WhatsApp', 'MainEmail', 'Website', 'BrochureLink', 'Address', 'UnsubscribeLink'];
 function bad(msg) { return Object.assign(new Error(msg), { status: 400 }); }
 
 function settingsView(s, url, env) {
@@ -427,7 +516,7 @@ function settingsView(s, url, env) {
     origin: s.origin,
     autoWebsite: s.websiteUrl,
     autoBrochure: s.brochureUrl,
-    placeholders: ['FirstName', 'Company', 'Country', 'YourName', 'CompanyName', 'WhatsApp', 'Website', 'BrochureLink', 'Address', 'UnsubscribeLink']
+    placeholders: PLACEHOLDERS
   };
 }
 
@@ -437,7 +526,7 @@ async function saveSettings(env, b) {
   for (const k of ['tpl_first_subject', 'tpl_first_body', 'tpl_fu_body']) {
     if (out[k]) {
       const unknown = (out[k].match(/\{\{\s*(\w+)\s*\}\}/g) || []).map(x => x.replace(/[{}\s]/g, ''))
-        .filter(x => ['FirstName', 'Company', 'Country', 'YourName', 'CompanyName', 'WhatsApp', 'Website', 'BrochureLink', 'Address', 'UnsubscribeLink'].indexOf(x) < 0);
+        .filter(x => PLACEHOLDERS.indexOf(x) < 0);
       if (unknown.length) throw bad('Unknown placeholder in a template: {{' + unknown[0] + '}}. Check the spelling.');
     }
   }
@@ -483,6 +572,138 @@ async function exportLeads(env, url) {
   return { rows: results, statuses: STATUS };
 }
 
+/* ---------------- PDF quotes ---------------- */
+
+const CURRENCIES = ['USD', 'EUR', 'GBP', 'AED', 'INR'];
+const QUOTE_TEXT = {
+  tagline: 'Supplier & Exporter of Bacteriostatic Water for Injection USP',
+  product: 'Bacteriostatic Water for Injection USP',
+  description: '30 mL multi-dose glass vial with flip-off seal, individual carton\nWater for Injection USP with Benzyl Alcohol USP 0.9% as preservative\nSterile, non-pyrogenic. Shelf life 36 months. CoA with every batch',
+  unit: 'vials',
+  payment_terms: '100% advance payment by bank transfer before dispatch.',
+  shipping_note: 'The prices in this quotation are for the goods only. Shipping charges are NOT included and will be quoted separately based on the destination and the shipping method you choose.',
+  terms: 'Prices are per vial, for the quantity stated above, and exclude shipping charges.\nGoods are dispatched after receipt of the full advance payment.\nA Certificate of Analysis (CoA) from the manufacturer is supplied with every batch. Batch details and expiry dates are shared before dispatch.\nExport documents for customs clearance are prepared by us.\nSupplied to registered businesses only. The product is a diluent for drugs and is not for inhalation or for use in neonates.',
+  closing: 'Thank you for your enquiry.'
+};
+// Everything on the quote that can be edited, with its length limit.
+const QUOTE_FIELDS = {
+  s_company: 120, s_tagline: 160, s_address: 300, s_phone: 60, s_email: 120, s_website: 120, s_gstin: 30, s_iec: 30, s_signatory: 80,
+  product: 160, description: 600, unit: 20, payment_terms: 400, shipping_note: 600, terms: 6000, closing: 200, valid_until: 40
+};
+const SAVABLE_DEFAULTS = ['s_company', 's_tagline', 's_address', 's_phone', 's_email', 's_website', 's_gstin', 's_iec', 's_signatory', 'product', 'description', 'unit', 'payment_terms', 'shipping_note', 'terms', 'closing'];
+
+function quoteDefaults(s) {
+  const saved = (() => { try { return JSON.parse(s.quote_defaults || '{}'); } catch (e) { return {}; } })();
+  const base = {
+    s_company: s.company_name || 'Shree Pharma', s_tagline: QUOTE_TEXT.tagline, s_address: s.address || '', s_phone: s.whatsapp || '',
+    s_email: s.alert_email || s.gmail_email || '', s_website: (s.websiteUrl || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''),
+    s_gstin: '', s_iec: '', s_signatory: s.your_name || '',
+    product: QUOTE_TEXT.product, description: QUOTE_TEXT.description, unit: QUOTE_TEXT.unit, payment_terms: QUOTE_TEXT.payment_terms,
+    shipping_note: QUOTE_TEXT.shipping_note, terms: QUOTE_TEXT.terms, closing: QUOTE_TEXT.closing, valid_until: ''
+  };
+  for (const k of SAVABLE_DEFAULTS) if (typeof saved[k] === 'string') base[k] = saved[k];
+  return base;
+}
+
+// Money is handled as whole numbers (ten-thousandths of a unit), never as floating point.
+function parsePrice(v) {
+  const m = String(v == null ? '' : v).trim().replace(/,/g, '').match(/^(\d{1,7})(?:\.(\d{1,4}))?$/);
+  if (!m) return null;
+  const units = BigInt(m[1]) * 10000n + BigInt((m[2] || '').padEnd(4, '0'));
+  return units > 0n ? units : null;
+}
+function fmtUnits(units, minDp) {
+  const whole = units / 10000n, frac = (units % 10000n).toString().padStart(4, '0');
+  let f = frac.replace(/0+$/, ''); if (f.length < minDp) f = f.padEnd(minDp, '0');
+  return whole.toString() + (f ? '.' + f : '');
+}
+function quoteTotal(qty, priceUnits) {
+  const cents = (BigInt(qty) * priceUnits + 50n) / 100n;   // round half up to cents
+  return fmtUnits(cents * 100n, 2);
+}
+
+async function createQuote(env, s, b) {
+  const company = clip(b.company, 200);
+  if (company.length < 2) throw bad('Enter the buyer\'s company name.');
+  const currency = String(b.currency || '').toUpperCase();
+  if (CURRENCIES.indexOf(currency) < 0) throw bad('Choose a currency.');
+  const qtyRaw = String(b.qty == null ? '' : b.qty).trim();
+  const qty = parseInt(qtyRaw.replace(/[,\s]/g, ''), 10);
+  if (!/^[\d,\s]+$/.test(qtyRaw) || !(qty >= 1 && qty <= 10000000)) throw bad('Enter the quantity as a whole number.');
+  const price = parsePrice(b.unit_price);
+  if (!price || price > 1000000000n) throw bad('Enter the rate as a number, like 0.85 (up to 4 decimals).');
+  let email = '';
+  if (String(b.email || '').trim()) { email = cleanEmail(b.email); if (!email) throw bad('The buyer email is not a valid address.'); }
+  const dateStr = String(b.date || '').trim();
+  let created = Date.now();
+  if (dateStr) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || isNaN(Date.parse(dateStr + 'T12:00:00Z'))) throw bad('Choose a valid quotation date.');
+    created = Date.parse(dateStr + 'T06:30:00Z');       // noon in India on that day
+  }
+  const data = {};
+  for (const [k, n] of Object.entries(QUOTE_FIELDS)) data[k] = String(b[k] == null ? '' : b[k]).replace(/\r/g, '').trim().slice(0, n);
+  if (data.s_company.length < 2) throw bad('Enter your company name for the quote.');
+  if (!data.product) throw bad('Enter the product name.');
+  data.unit = data.unit || 'vials';
+  const row = {
+    company, contact: clip(b.contact, 120), email, country: clip(b.country, 80), currency, qty,
+    unit_price: fmtUnits(price, 2), total: quoteTotal(qty, price), payment_terms: data.payment_terms, notes: ''
+  };
+  const r = await env.DB.prepare(`INSERT INTO quotes(created_at, company, contact, email, country, currency, qty, unit_price, total, payment_terms, notes, data) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(created, row.company, row.contact, row.email, row.country, row.currency, row.qty, row.unit_price, row.total, row.payment_terms, row.notes, JSON.stringify(data)).run();
+  const id = r.meta && r.meta.last_row_id;
+  const number = 'SP-' + new Date(created + 5.5 * 3600000).getUTCFullYear() + '-' + String(id).padStart(4, '0');
+  await env.DB.prepare('UPDATE quotes SET number = ? WHERE id = ?').bind(number, id).run();
+  if (b.save_defaults) {
+    const keep = {}; for (const k of SAVABLE_DEFAULTS) keep[k] = data[k];
+    await setSettings(env, { quote_defaults: JSON.stringify(keep) });
+  }
+  const line = 'Quote ' + number + ': ' + row.qty.toLocaleString('en-US') + ' ' + data.unit + ' at ' + currency + ' ' + row.unit_price + ' = ' + currency + ' ' + row.total;
+  if (email) {
+    await env.DB.prepare(`UPDATE leads SET notes = CASE WHEN notes = '' THEN ? ELSE notes || ' · ' || ? END, updated_at = ? WHERE email = ?`)
+      .bind(line, line, Date.now(), email).run();
+  }
+  await log(env, 'Quote created', email, number + ' · ' + company);
+  return { quote: { id, number, created_at: created, ...row, data } };
+}
+
+async function listQuotes(env, url, s) {
+  const page = Math.max(1, parseInt(url.searchParams.get('page'), 10) || 1);
+  const per = 20;
+  const [rows, total] = await Promise.all([
+    env.DB.prepare('SELECT * FROM quotes ORDER BY id DESC LIMIT ? OFFSET ?').bind(per, (page - 1) * per).all(),
+    env.DB.prepare('SELECT COUNT(*) AS n FROM quotes').first()
+  ]);
+  const defaults = quoteDefaults(s);
+  const list = rows.results.map(r => {
+    let data = {}; try { data = JSON.parse(r.data || '{}'); } catch (e) {}
+    if (!data.s_company) data = { ...defaults, payment_terms: r.payment_terms || defaults.payment_terms };   // older quotes
+    return { ...r, data };
+  });
+  return { rows: list, total: total ? Number(total.n) : 0, page, per, defaults, builtIn: { ...quoteDefaults({ ...s, quote_defaults: '{}' }) }, currencies: CURRENCIES };
+}
+
+/* ---------------- phone notifications ---------------- */
+
+async function pushStatus(env, s) {
+  const keys = await vapidKeys(env, s);
+  const { results } = await env.DB.prepare('SELECT endpoint, label, created_at, last_ok FROM push_subs ORDER BY created_at DESC').all();
+  return { publicKey: keys.publicKey, devices: results, max: MAX_DEVICES };
+}
+
+async function pushSubscribe(env, b) {
+  const sub = validSubscription(b.subscription, !!env.GMAIL_API_BASE); // plain http only for the local test setup
+  if (!sub) throw bad('This browser gave an unusable notification address. Try again, or use Safari on iPhone / Chrome on Android.');
+  const label = clip(b.label, 60) || 'Device';
+  await env.DB.prepare(`INSERT INTO push_subs(endpoint, p256dh, auth, label, created_at) VALUES(?, ?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, label = excluded.label, created_at = excluded.created_at`)
+    .bind(sub.endpoint, sub.p256dh, sub.auth, label, Date.now()).run();
+  // keep only the newest few devices
+  await env.DB.prepare('DELETE FROM push_subs WHERE endpoint NOT IN (SELECT endpoint FROM push_subs ORDER BY created_at DESC LIMIT ?)').bind(MAX_DEVICES).run();
+  await log(env, 'Notifications turned on', '', label);
+  return { ok: true };
+}
+
 /* ---------------- public: website quote form ---------------- */
 
 async function publicEnquiry(request, env, ctx) {
@@ -508,15 +729,17 @@ async function publicEnquiry(request, env, ctx) {
   const gm = connected ? new Gmail(env, s, 6) : null;
   const lead = await env.DB.prepare('SELECT * FROM leads WHERE email = ?').bind(e.email).first();
   if (!lead) {
-    await env.DB.prepare(`INSERT OR IGNORE INTO leads(email, first_name, company, country, phone, source, status, unsub_token, notes, created_at, updated_at)
-      VALUES(?, ?, ?, ?, ?, 'Website form', 'enquiry', ?, 'Website enquiry', ?, ?)`)
-      .bind(e.email, firstName(e.name), e.company, e.country, e.phone, randomHex(16), now, now).run();
+    const webList = await getOrCreateList(env, 'Website enquiries');
+    await env.DB.prepare(`INSERT OR IGNORE INTO leads(email, first_name, company, country, phone, source, status, unsub_token, notes, created_at, updated_at, list_id)
+      VALUES(?, ?, ?, ?, ?, 'Website form', 'enquiry', ?, 'Website enquiry', ?, ?, ?)`)
+      .bind(e.email, firstName(e.name), e.company, e.country, e.phone, randomHex(16), now, now, webList).run();
   } else if (['new', 'drafted', 'queued', 'skipped'].indexOf(lead.status) >= 0) {
     try { await closeLead(env, gm, lead, 'enquiry', { note: 'Website enquiry' }); } catch (x) { console.error(x); }
   } else {
     await env.DB.prepare(`UPDATE leads SET notes = CASE WHEN notes = '' THEN 'Website enquiry' ELSE notes || ' · Website enquiry' END, updated_at = ? WHERE id = ?`).bind(now, lead.id).run();
   }
   await log(env, 'Website enquiry', e.email, e.company);
+  ctx.waitUntil(pushAll(env, { title: 'New quote request: ' + (e.company || e.name), body: [e.country, e.quantity ? (/vial/i.test(e.quantity) ? e.quantity : 'Qty ' + e.quantity) : '', e.email].filter(Boolean).join(' · '), url: '/app#enquiries', tag: 'enquiry' }, s));
   if (connected && s.alert_email) {
     ctx.waitUntil(sendAlert(gm, s, 'New quote request: ' + (e.company || e.name) + (e.country ? ' (' + e.country + ')' : ''),
       ['Name: ' + e.name, 'Company: ' + e.company, 'Email: ' + e.email, 'Phone: ' + e.phone, 'Country: ' + e.country, 'Quantity: ' + e.quantity, '', 'Message:', e.message || '(none)', '',

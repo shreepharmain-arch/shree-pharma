@@ -2,6 +2,7 @@
 import { getSettings, setSettings, log, counter, bump, housekeeping, ensureSchema } from './db.js';
 import { Gmail, GmailAuthError, BudgetError, buildMime, textToHtml, headerOf } from './gmail.js';
 import { addBusinessDays, istDay, istMinutes, istWeekday, isYes, stripQuote, htmlToText, b64urlDecode, headerEmail, cleanEmail } from './util.js';
+import { pushAll } from './push.js';
 
 export const STATUS = {
   new: 'New', drafting: 'Preparing draft', drafted: 'Draft ready', queued: 'Queued to send', sending: 'Sending',
@@ -46,25 +47,47 @@ export function render(tpl, lead, s) {
     Website: s.websiteUrl || '',
     BrochureLink: s.brochureUrl || '',
     Address: s.address || '',
+    MainEmail: mainEmailFor(s),
     UnsubscribeLink: s.origin && lead.unsub_token ? s.origin + '/u/' + lead.unsub_token : ''
   };
   const fill = line => line.replace(/\{\{\s*(\w+)\s*\}\}/g, (m, k) => (k in map ? String(map[k]) : m));
   const lines = String(tpl || '').replace(/\r\n/g, '\n').split('\n');
   const out = [];
   for (const line of lines) {
-    const only = line.trim().match(/^\{\{\s*(\w+)\s*\}\}$/);
-    if (only && only[1] in map && !String(map[only[1]]).trim()) continue; // drop a line whose only content is empty
+    // drop a line whose placeholders are all empty, e.g. "Company email: {{MainEmail}}" when there is none
+    const keys = (line.match(/\{\{\s*(\w+)\s*\}\}/g) || []).map(x => x.replace(/[{}\s]/g, ''));
+    if (keys.length && keys.every(k => k in map && !String(map[k]).trim())) continue;
     out.push(fill(line).replace(/[ \t]+$/, ''));
   }
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// The company email shown in the signature; hidden when it is the address the email is sent from.
+export function mainEmailFor(s) {
+  const m = String(s.main_email || '').trim().toLowerCase();
+  return m && m !== String(s.gmail_email || '').trim().toLowerCase() ? m : '';
+}
+
+// True when the lead's first email went out from a different Gmail account than the one connected now.
+export function movedSender(lead, s) {
+  const a = String(lead.sent_from || '').trim().toLowerCase(), b = String(s.gmail_email || '').trim().toLowerCase();
+  return !!(a && b && a !== b);
+}
+
 export function compose(lead, kind, s) {
   const isFu = kind === 'fu';
-  const subject = isFu
-    ? (/^re:/i.test(lead.subject || '') ? lead.subject : 'Re: ' + (lead.subject || ''))
-    : render(s.tpl_first_subject, lead, s).replace(/\s+/g, ' ').trim();
-  const text = render(isFu ? s.tpl_fu_body : s.tpl_first_body, lead, s);
+  const moved = isFu && movedSender(lead, s);
+  const orig = String(lead.subject || '').replace(/^(re:\s*)+/i, '').trim();
+  const subject = !isFu
+    ? render(s.tpl_first_subject, lead, s).replace(/\s+/g, ' ').trim()
+    : moved ? 'Following up: ' + orig : 'Re: ' + orig;
+  let text = render(isFu ? s.tpl_fu_body : s.tpl_first_body, lead, s);
+  if (moved) {
+    // a fresh email (not in the old thread), so say where the earlier one came from
+    const note = 'I wrote to you earlier from ' + String(lead.sent_from).toLowerCase() + '. I am now writing from our sales address.';
+    const cut = text.indexOf('\n\n');
+    text = cut > 0 ? text.slice(0, cut) + '\n\n' + note + text.slice(cut) : note + '\n\n' + text;
+  }
   const unsubUrl = s.origin && lead.unsub_token ? s.origin + '/u/' + lead.unsub_token : '';
   const listUnsub = [unsubUrl && '<' + unsubUrl + '>', s.gmail_email && '<mailto:' + s.gmail_email + '?subject=unsubscribe>'].filter(Boolean).join(', ');
   const raw = buildMime({
@@ -74,7 +97,7 @@ export function compose(lead, kind, s) {
     subject,
     text,
     html: textToHtml(text),
-    inReplyTo: isFu ? lead.message_id : '',
+    inReplyTo: isFu && !moved ? lead.message_id : '',
     listUnsubscribe: listUnsub,
     oneClick: !!unsubUrl
   });
@@ -88,6 +111,49 @@ export async function pendingCount(env) {
   return r ? Number(r.n) : 0;
 }
 export const sentTodayKey = () => 'sent:' + istDay();
+
+// Start of today in India, as a timestamp.
+export function istDayStart() { const d = istDay(); return Date.parse(d + 'T00:00:00+05:30'); }
+
+// Splits the total daily limit evenly across active lists that still have work.
+// A list that cannot use its full share (few leads left) passes the rest to the others.
+export async function listPlan(env, s) {
+  const limit = dailyLimit(s), now = Date.now(), dayStart = istDayStart();
+  const { results } = await env.DB.prepare(`
+    SELECT l.id, l.name, l.active, l.created_at,
+      COUNT(d.id) AS total,
+      SUM(CASE WHEN d.status = 'new' THEN 1 ELSE 0 END) AS fresh,
+      SUM(CASE WHEN d.status = 'sent' AND d.followup_due IS NOT NULL AND d.followup_due <= ? THEN 1 ELSE 0 END) AS fu_due,
+      SUM(CASE WHEN d.status IN (${ph(PENDING.length)}) THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN (d.sent_at >= ?) OR (d.followup_sent_at >= ?) THEN 1 ELSE 0 END) AS sent_today,
+      SUM(CASE WHEN d.sent_at IS NOT NULL THEN 1 ELSE 0 END) AS sent_ever,
+      SUM(CASE WHEN d.status IN ('replied','interested','client','not_interested') THEN 1 ELSE 0 END) AS replies
+    FROM lists l LEFT JOIN leads d ON d.list_id = l.id
+    GROUP BY l.id ORDER BY l.id`).bind(now, ...PENDING, dayStart, dayStart).all();
+  const lists = results.map(r => {
+    const o = { id: r.id, name: r.name, active: !!r.active, created_at: r.created_at };
+    for (const k of ['total', 'fresh', 'fu_due', 'pending', 'sent_today', 'sent_ever', 'replies']) o[k] = Number(r[k] || 0);
+    o.used = o.pending + o.sent_today;
+    o.want = o.used + o.fresh + o.fu_due;          // the most this list could use today
+    o.share = 0;
+    return o;
+  });
+  // water-filling: equal split among lists that can still use more
+  let pool = limit, open = lists.filter(l => l.active && l.want > 0);
+  while (pool > 0 && open.length) {
+    const each = Math.floor(pool / open.length), extra = pool % open.length;
+    let given = 0;
+    open.forEach((l, i) => {
+      const offer = each + (i < extra ? 1 : 0);
+      const take = Math.min(offer, l.want - l.share);
+      l.share += take; given += take;
+    });
+    pool -= given;
+    if (!given) break;
+    open = open.filter(l => l.share < l.want);
+  }
+  return { limit, lists };
+}
 
 /* ---------- drafts ---------- */
 
@@ -104,25 +170,40 @@ export async function createDrafts(env, gm, s, max) {
   const limit = dailyLimit(s);
   let room = Math.min(max, limit - (await pendingCount(env)) - (await counter(env, sentTodayKey())), Math.max(0, gm.budget - 2));
   if (room <= 0) return result;
+  const plan = await listPlan(env, s);
+  // each list may draft up to its share of today's limit, minus what it already used
+  const rooms = plan.lists.filter(l => l.active).map(l => ({ id: l.id, room: Math.max(0, l.share - l.used) })).filter(x => x.room > 0);
+  for (const lr of rooms) {
+    if (room <= 0 || gm.budget < 3) break;
+    let listRoom = Math.min(lr.room, room);
+    const before = result.created;
+    await draftList(env, gm, s, lr.id, listRoom, result);
+    room -= result.created - before;
+  }
+  if (result.created) await log(env, 'Drafts created', '', result.created + ' draft(s), ' + result.followups + ' follow-up(s)');
+  return result;
+}
 
+async function draftList(env, gm, s, listId, room, result) {
   for (const kind of ['fu', 'first']) {
    for (let round = 0; round < 5 && room > 0 && gm.budget >= 3; round++) {
     const now = Date.now();
     const claimed = kind === 'fu'
       ? (await env.DB.prepare(
           `UPDATE leads SET status = 'fu_drafting', updated_at = ? WHERE id IN (
-             SELECT id FROM leads WHERE status = 'sent' AND followup_due IS NOT NULL AND followup_due <= ? ORDER BY followup_due LIMIT ?)
-           RETURNING *`).bind(now, now, room).all()).results
+             SELECT id FROM leads WHERE list_id = ? AND status = 'sent' AND followup_due IS NOT NULL AND followup_due <= ? ORDER BY followup_due LIMIT ?)
+           RETURNING *`).bind(now, listId, now, room).all()).results
       : (await env.DB.prepare(
           `UPDATE leads SET status = 'drafting', updated_at = ? WHERE id IN (
-             SELECT id FROM leads WHERE status = 'new' ORDER BY id LIMIT ?)
-           RETURNING *`).bind(now, room).all()).results;
+             SELECT id FROM leads WHERE list_id = ? AND status = 'new' ORDER BY id LIMIT ?)
+           RETURNING *`).bind(now, listId, room).all()).results;
     if (!claimed.length) break;
     const back = kind === 'fu' ? 'sent' : 'new';
     for (let i = 0; i < claimed.length; i++) {
       const lead = claimed[i];
       try {
-        if (kind === 'fu' && !lead.message_id && lead.thread_id) {
+        const moved = kind === 'fu' && movedSender(lead, s);
+        if (kind === 'fu' && !moved && !lead.message_id && lead.thread_id) {
           // older sends may lack the Message-ID; fetch it so the follow-up threads correctly for the buyer
           try {
             const t = await gm.listMessages('in:sent to:' + lead.email, 1);
@@ -134,7 +215,7 @@ export async function createDrafts(env, gm, s, max) {
           } catch (e) { if (e instanceof GmailAuthError || e instanceof BudgetError) throw e; }
         }
         const c = compose(lead, kind, s);
-        const d = await gm.createDraft(c.raw, kind === 'fu' ? lead.thread_id : undefined);
+        const d = await gm.createDraft(c.raw, kind === 'fu' && !moved ? lead.thread_id : undefined);
         const now2 = Date.now();
         if (kind === 'fu') {
           const u = await env.DB.prepare(`UPDATE leads SET status = 'fu_drafted', draft_id = ?, drafted_at = ?, draft_subject = ?, draft_body = ?, message_id = ?, updated_at = ? WHERE id = ? AND status = 'fu_drafting'`)
@@ -166,7 +247,6 @@ export async function createDrafts(env, gm, s, max) {
     }
   }
   }
-  if (result.created) await log(env, 'Drafts created', '', result.created + ' draft(s), ' + result.followups + ' follow-up(s)');
   return result;
 }
 
@@ -178,15 +258,18 @@ async function draftGone(env, gm, lead, isFu, s) {
   const r = await gm.listMessages('in:sent to:' + lead.email + ' after:' + since, 1);
   const m = r.messages && r.messages[0];
   const now = Date.now();
-  if (m && (!isFu || !lead.thread_id || m.threadId === lead.thread_id)) {
+  const moved = isFu && movedSender(lead, s);
+  if (m && (!isFu || moved || !lead.thread_id || m.threadId === lead.thread_id)) {
     await bump(env, sentTodayKey());
     if (isFu) {
-      await env.DB.prepare(`UPDATE leads SET status = 'fu_sent', followup_sent_at = ?, draft_id = NULL, updated_at = ? WHERE id = ?`).bind(now, now, lead.id).run();
+      await env.DB.prepare(`UPDATE leads SET status = 'fu_sent', followup_sent_at = ?, draft_id = NULL,
+          thread_id = CASE WHEN ? THEN ? ELSE thread_id END, sent_from = CASE WHEN ? THEN ? ELSE sent_from END, updated_at = ? WHERE id = ?`)
+        .bind(now, moved ? 1 : 0, m.threadId || null, moved ? 1 : 0, s.gmail_email, now, lead.id).run();
     } else {
       let mid = '';
       try { mid = headerOf(await gm.getMessage(m.id, 'metadata', ['Message-ID']), 'Message-ID'); } catch (e) { if (e instanceof GmailAuthError) throw e; }
-      await env.DB.prepare(`UPDATE leads SET status = 'sent', sent_at = ?, thread_id = ?, message_id = ?, followup_due = ?, draft_id = NULL, updated_at = ? WHERE id = ?`)
-        .bind(now, m.threadId, mid || null, addBusinessDays(now, parseInt(s.followup_days, 10) || 4), now, lead.id).run();
+      await env.DB.prepare(`UPDATE leads SET status = 'sent', sent_at = ?, thread_id = ?, message_id = ?, sent_from = ?, followup_due = ?, draft_id = NULL, updated_at = ? WHERE id = ?`)
+        .bind(now, m.threadId, mid || null, s.gmail_email, addBusinessDays(now, parseInt(s.followup_days, 10) || 4), now, lead.id).run();
     }
     await log(env, isFu ? 'Follow-up sent from Gmail' : 'Sent from Gmail', lead.email, '');
   } else {
@@ -215,13 +298,17 @@ export async function sendQueued(env, gm, s, max) {
       await bump(env, sentTodayKey());
       const t = Date.now();
       if (isFu) {
-        await env.DB.prepare(`UPDATE leads SET status = CASE status WHEN 'fu_sending' THEN 'fu_sent' ELSE status END, followup_sent_at = ?, draft_id = NULL, updated_at = ? WHERE id = ?`).bind(t, t, lead.id).run();
+        // a follow-up from a new account starts a new thread: watch that one for replies from now on
+        const moved = movedSender(lead, s) && msg.threadId ? 1 : 0;
+        await env.DB.prepare(`UPDATE leads SET status = CASE status WHEN 'fu_sending' THEN 'fu_sent' ELSE status END, followup_sent_at = ?, draft_id = NULL,
+            thread_id = CASE WHEN ? THEN ? ELSE thread_id END, sent_from = CASE WHEN ? THEN ? ELSE sent_from END, updated_at = ? WHERE id = ?`)
+          .bind(t, moved, msg.threadId || null, moved, s.gmail_email, t, lead.id).run();
       } else {
         let mid = '';
         try { mid = headerOf(await gm.getMessage(msg.id, 'metadata', ['Message-ID']), 'Message-ID'); }
         catch (e) { if (e instanceof GmailAuthError) throw e; }
-        await env.DB.prepare(`UPDATE leads SET status = 'sent', sent_at = ?, thread_id = ?, message_id = ?, followup_due = ?, draft_id = NULL, updated_at = ? WHERE id = ?`)
-          .bind(t, msg.threadId || null, mid || null, addBusinessDays(t, parseInt(s.followup_days, 10) || 4), t, lead.id).run();
+        await env.DB.prepare(`UPDATE leads SET status = 'sent', sent_at = ?, thread_id = ?, message_id = ?, sent_from = ?, followup_due = ?, draft_id = NULL, updated_at = ? WHERE id = ?`)
+          .bind(t, msg.threadId || null, mid || null, s.gmail_email, addBusinessDays(t, parseInt(s.followup_days, 10) || 4), t, lead.id).run();
       }
       await log(env, isFu ? 'Follow-up sent' : 'Sent', lead.email, '');
       sent++;
@@ -350,6 +437,14 @@ export async function checkReplies(env, gm, s, cap = 12) {
     else if (r.kind === 'no') out.notInterested++;
   }
   if (done === unseen.length && !list.nextPageToken) await setSettings(env, { replies_cursor: String(nowSec - 120) });
+  if (out.fresh.length) {
+    const first = out.fresh[0].lead;
+    await pushAll(env, {
+      title: out.fresh.length > 1 ? out.fresh.length + ' new replies from buyers' : 'Reply from ' + (first.company || first.email),
+      body: out.fresh.length > 1 ? out.fresh.map(f => f.lead.company || f.lead.email).slice(0, 4).join(', ') : '"' + out.fresh[0].snippet.slice(0, 140) + '"',
+      url: '/app#home', tag: 'reply'
+    }, s);
+  }
   if (out.fresh.length && s.alert_email) {
     const lines = out.fresh.map(f => '• ' + (f.lead.company || f.lead.email) + (f.lead.country ? ' (' + f.lead.country + ')' : '') +
       '\n  ' + f.lead.email + '\n  "' + f.snippet.slice(0, 220) + '"\n  Open: https://mail.google.com/mail/?authuser=' + encodeURIComponent(s.gmail_email) + '#all/' + f.threadId);
@@ -416,7 +511,7 @@ export async function runCron(env) {
   await recoverStale(env);
   await stopWatching(env, s);
   if (!s.gmail_refresh || !s.gmail_email) return { skipped: 'not connected' };
-  const gm = new Gmail(env, s, 45);
+  const gm = new Gmail(env, s, 38); // leaves room for phone notifications within the 50-request limit
   const report = {};
   try {
     report.replies = await checkReplies(env, gm, s, 12);
@@ -435,6 +530,7 @@ export async function runCron(env) {
         FROM leads`).first();
       const ready = Number((r && r.ready) || 0);
       if (ready > 0) {
+        await pushAll(env, { title: ready + ' email' + (ready > 1 ? 's' : '') + ' ready to approve', body: 'Open the dashboard to approve and send.', url: '/app#home', tag: 'summary' }, s);
         await sendAlert(gm, s, 'Ready to approve: ' + ready + ' email' + (ready > 1 ? 's' : ''),
           ready + ' email draft(s) are waiting for your approval.\n' + Number((r && r.fresh) || 0) + ' lead(s) have not been emailed yet.\n\n' +
           'Open your dashboard: ' + (s.origin ? s.origin + '/app' : '(your dashboard link)') +
