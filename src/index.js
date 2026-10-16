@@ -492,7 +492,7 @@ const SETTING_RULES = {
   brochure_link: v => { v = clip(v, 500); if (v && !/^https?:\/\/[^\s]+$/i.test(v)) throw bad('Brochure link must start with https://'); return v; },
   alert_email: v => { if (!String(v || '').trim()) return ''; const e = cleanEmail(v); if (!e) throw bad('Alert email is not a valid email address'); return e; },
   main_email: v => { if (!String(v || '').trim()) return ''; const e = cleanEmail(v); if (!e) throw bad('Company email is not a valid email address'); return e; },
-  daily_limit: v => { const n = parseInt(v, 10); if (!(n >= 1 && n <= 150)) throw bad('Daily limit must be between 1 and 150'); return String(n); },
+  daily_limit: v => { const n = parseInt(v, 10); if (!(n >= 1 && n <= 250)) throw bad('Daily limit must be between 1 and 250'); return String(n); },
   followup_days: v => { const n = parseInt(v, 10); if (!(n >= 1 && n <= 30)) throw bad('Follow-up days must be between 1 and 30'); return String(n); },
   stop_days: v => { const n = parseInt(v, 10); if (!(n >= 1 && n <= 60)) throw bad('Stop-watching days must be between 1 and 60'); return String(n); },
   auto_drafts: v => (isYes(v) ? 'yes' : 'no'),
@@ -592,16 +592,21 @@ const QUOTE_FIELDS = {
 };
 const SAVABLE_DEFAULTS = ['s_company', 's_tagline', 's_address', 's_phone', 's_email', 's_website', 's_gstin', 's_iec', 's_signatory', 'product', 'description', 'unit', 'payment_terms', 'shipping_note', 'terms', 'closing'];
 
+const BUSINESS_IDS = { gstin: '27ADHPM6491M1ZU', iec: '0305066081' };
 function quoteDefaults(s) {
   const saved = (() => { try { return JSON.parse(s.quote_defaults || '{}'); } catch (e) { return {}; } })();
   const base = {
     s_company: s.company_name || 'Shree Pharma', s_tagline: QUOTE_TEXT.tagline, s_address: s.address || '', s_phone: s.whatsapp || '',
     s_email: s.alert_email || s.gmail_email || '', s_website: (s.websiteUrl || '').replace(/^https?:\/\//, '').replace(/\/+$/, ''),
-    s_gstin: '', s_iec: '', s_signatory: s.your_name || '',
+    s_gstin: BUSINESS_IDS.gstin, s_iec: BUSINESS_IDS.iec, s_signatory: s.your_name || '',
     product: QUOTE_TEXT.product, description: QUOTE_TEXT.description, unit: QUOTE_TEXT.unit, payment_terms: QUOTE_TEXT.payment_terms,
     shipping_note: QUOTE_TEXT.shipping_note, terms: QUOTE_TEXT.terms, closing: QUOTE_TEXT.closing, valid_until: ''
   };
-  for (const k of SAVABLE_DEFAULTS) if (typeof saved[k] === 'string') base[k] = saved[k];
+  for (const k of SAVABLE_DEFAULTS) {
+    if (typeof saved[k] !== 'string') continue;
+    if ((k === 's_gstin' || k === 's_iec') && !saved[k].trim()) continue; // an old blank default never hides the registered numbers
+    base[k] = saved[k];
+  }
   return base;
 }
 

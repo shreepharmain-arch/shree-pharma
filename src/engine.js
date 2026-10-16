@@ -15,7 +15,7 @@ export const PENDING = ['drafting', 'drafted', 'queued', 'sending', 'fu_drafting
 export const WATCH = ['sent', 'fu_drafting', 'fu_drafted', 'fu_queued', 'fu_sending', 'fu_sent', 'no_reply'];
 export const HAS_DRAFT = ['drafted', 'queued', 'fu_drafted', 'fu_queued'];
 export const MANUAL_STATUSES = ['new', 'replied', 'interested', 'client', 'not_interested', 'no_reply', 'dnc'];
-const MAX_DAILY = 150;
+const MAX_DAILY = 250;
 
 const ph = n => Array(n).fill('?').join(',');
 
