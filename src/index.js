@@ -5,7 +5,7 @@ import { ensureSchema, getSettings, setSettings, log, counter, bump, EDITABLE, D
 import { Gmail, GmailAuthError, BudgetError, oauthStartUrl, exchangeCode, googleUrls, buildMime, textToHtml } from './gmail.js';
 import {
   STATUS, PENDING, HAS_DRAFT, MANUAL_STATUSES, effective, dailyLimit, createDrafts, sendQueued, checkReplies, syncDrafts,
-  closeLead, sendAlert, compose, runCron, sentTodayKey, listPlan
+  closeLead, sendAlert, compose, runCron, sentTodayKey, listPlan, pendingCount
 } from './engine.js';
 import { pushAll, vapidKeys, validSubscription, SERVICE_WORKER, MAX_DEVICES } from './push.js';
 import {
@@ -437,9 +437,17 @@ async function updateList(env, b) {
   return { ok: true };
 }
 
+// How many more drafts today's limit still allows, counting only lists that are on and still have leads.
+async function draftRoom(env, s) {
+  const [plan, pending, sent] = await Promise.all([listPlan(env, s), pendingCount(env), counter(env, sentTodayKey())]);
+  const byLists = plan.lists.filter(l => l.active).reduce((a, l) => a + Math.max(0, l.share - l.used), 0);
+  return Math.max(0, Math.min(dailyLimit(s) - pending - sent, byLists));
+}
+
 async function apiDrafts(env, s, gm) {
   if (!s.gmail_email) return { created: 0, message: 'Connect Gmail in Settings first.' };
   const r = await createDrafts(env, gm, s, 12);
+  r.room = await draftRoom(env, s);
   if (r.created) return { ...r, message: r.created + ' draft(s) created in Gmail' + (r.followups ? ', including ' + r.followups + ' follow-up(s)' : '') + '.' };
   const fresh = await env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE status = 'new'`).first();
   if (!fresh || !Number(fresh.n)) return { ...r, message: 'No new leads left to email. Import more leads.' };
