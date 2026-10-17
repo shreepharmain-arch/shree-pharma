@@ -125,7 +125,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--ink);box
 .kv dd{margin:0;overflow-wrap:anywhere}
 .counts{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--mute)}
 .progress{height:8px;background:#e9edf2;border-radius:6px;overflow:hidden;margin-top:12px}
-.progress i{display:block;height:100%;background:var(--magenta);width:0;transition:width .2s}
+.progress i{display:block;height:100%;background:var(--magenta);width:0;transition:width .3s}
+#draftProg{padding:14px 16px}
+.dp-row{display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap}
 .code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;background:var(--bg);padding:6px 8px;border-radius:6px;display:block;overflow-wrap:anywhere;margin-top:4px}
 .ph{display:inline-block;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:var(--bg);border-radius:5px;padding:2px 6px;margin:2px 4px 2px 0;cursor:pointer;border:1px solid var(--rule)}
 
@@ -234,6 +236,11 @@ details.qsect{margin-top:12px;box-shadow:none}
     </div>
   </div>
   <div id="homeMsg" role="status"></div>
+  <div class="card" id="draftProg" hidden>
+    <div class="dp-row"><b id="draftProgText">Creating drafts…</b><span class="muted" id="draftProgNum"></span></div>
+    <div class="progress" role="progressbar" aria-labelledby="draftProgText" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="draftBar"><i></i></div>
+    <p class="help" style="margin:8px 0 0">Gmail allows about 12 at a time, so this runs in batches. You can keep using the dashboard.</p>
+  </div>
 
   <div class="card" id="approveCard" hidden>
     <div class="card-head">
@@ -711,11 +718,52 @@ $('skipSel').onclick = () => busy($('skipSel'), async () => {
   } catch (e) { msg($('homeMsg'), e.message + (n ? ' (' + n + ' skipped before this)' : ''), 'err'); }
   loadHome();
 }, 'Skipping…');
-$('makeDrafts').onclick = () => busy($('makeDrafts'), async () => {
-  try { const r = await api('/api/drafts', {}); msg($('homeMsg'), r.message || (r.created + ' created'), r.created ? 'ok' : 'warn'); }
-  catch (e) { msg($('homeMsg'), e.message, 'err'); }
-  loadHome();
-}, 'Creating…');
+// Creates drafts in batches of about 12 (Cloudflare's limit per request) until today's limit is covered.
+let draftRun = false;
+function drawDraftProg(made, total, done) {
+  const pct = total > 0 ? Math.min(100, Math.round(made / total * 100)) : (done ? 100 : 0);
+  $('draftBar').firstElementChild.style.width = pct + '%';
+  $('draftBar').setAttribute('aria-valuenow', String(pct));
+  $('draftProgNum').textContent = total > 0 ? made + ' of ' + total : (made ? made + ' made' : '');
+  $('draftProgText').textContent = done ? (made ? made + ' draft' + (made === 1 ? '' : 's') + ' ready' : 'No new drafts') : 'Creating drafts…';
+}
+async function notifyDraftsReady(n) {
+  const title = n + ' draft' + (n === 1 ? '' : 's') + ' ready to approve';
+  toast(title);
+  try {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const opts = { body: 'Open Home to review and approve them.', icon: '/icon-512.png', badge: '/icon-512.png', tag: 'drafts', renotify: true, data: { url: '/app#home' } };
+    const reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration('/app') : null;
+    if (reg) await reg.showNotification(title, opts); else new Notification(title, opts);
+  } catch (e) { /* the on-screen message already says it */ }
+}
+$('makeDrafts').onclick = () => {
+  if (draftRun) return;
+  draftRun = true;
+  return busy($('makeDrafts'), async () => {
+    let made = 0, total = 0, last = null, err = '';
+    $('draftProg').hidden = false; msg($('homeMsg'), '');
+    drawDraftProg(0, 0, false);
+    try {
+      for (let round = 0; round < 30; round++) {
+        const r = await api('/api/drafts', {});
+        last = r; made += r.created || 0;
+        const room = typeof r.room === 'number' ? r.room : 0;
+        total = made + room;
+        drawDraftProg(made, total, false);
+        if (!r.created || room <= 0 || r.failed) break;
+      }
+    } catch (e) { err = e.message; }
+    drawDraftProg(made, made, true);
+    if (err) msg($('homeMsg'), err + (made ? ' (' + made + ' draft' + (made === 1 ? '' : 's') + ' were made before this.)' : ''), 'err');
+    else if (made) {
+      msg($('homeMsg'), made + ' draft' + (made === 1 ? '' : 's') + ' created in Gmail and ready to approve.' + (last && last.failed ? ' Some leads were skipped; see the activity log.' : ''), 'ok');
+      notifyDraftsReady(made);
+    } else msg($('homeMsg'), (last && last.message) || 'No drafts were created.', 'warn');
+    setTimeout(() => { $('draftProg').hidden = true; }, made ? 4000 : 0);
+    loadHome();
+  }, 'Creating…').finally(() => { draftRun = false; });
+};
 $('checkNow').onclick = () => busy($('checkNow'), async () => {
   try {
     const r = await api('/api/replies', {});
